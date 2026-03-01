@@ -21,7 +21,7 @@ class AskRequest(BaseModel):
 
 
 def extract_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|youtu\.be/)([^&]+)", url)
+    match = re.search(r"(?:v=|youtu\.be/)([^&?/]+)", url)
     if not match:
         raise ValueError("Invalid YouTube URL")
     return match.group(1)
@@ -40,13 +40,14 @@ def ask(request: AskRequest):
 
     video_id = extract_video_id(request.video_url)
 
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    # ✅ NEW API STYLE
+    transcript = YouTubeTranscriptApi().fetch(video_id)
 
     topic = request.topic.lower()
 
     for entry in transcript:
-        if topic in entry["text"].lower():
-            timestamp = seconds_to_hhmmss(entry["start"])
+        if topic in entry.text.lower():
+            timestamp = seconds_to_hhmmss(entry.start)
             return {
                 "timestamp": timestamp,
                 "video_url": request.video_url,
