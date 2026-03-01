@@ -112,8 +112,7 @@ async def ask_topic(request: AskRequest):
         formatted_transcript = ""
         for entry in raw_transcript:
             time_str = format_seconds_to_hhmmss(entry['start'])
-            formatted_transcript += f"[{time_str}] {entry['text']}
-"
+            formatted_transcript += f"[{time_str}] {entry['text']}\n"
     except Exception as e:
         print(f"Transcript Error: {e}")
         raise HTTPException(status_code=500, detail="Could not get transcript for this video.")
