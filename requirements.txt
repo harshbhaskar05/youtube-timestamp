@@ -1,4 +1,3 @@
 fastapi
 uvicorn
-yt-dlp
-faster-whisper
+youtube-transcript-api

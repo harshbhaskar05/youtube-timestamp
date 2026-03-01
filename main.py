@@ -1,14 +1,12 @@
-import os
-import tempfile
-import subprocess
+import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from faster_whisper import WhisperModel
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
-# ✅ ADD THIS CORS BLOCK
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,35 +15,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Use tiny model for Render
-model = WhisperModel("tiny", compute_type="int8")
-
-
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
 
-def download_audio(video_url: str):
-    temp_dir = tempfile.mkdtemp()
-    output_template = os.path.join(temp_dir, "audio.%(ext)s")
-
-    command = [
-        "yt-dlp",
-        "-f", "bestaudio",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "-o", output_template,
-        video_url
-    ]
-
-    subprocess.run(command, check=True)
-
-    for file in os.listdir(temp_dir):
-        if file.endswith(".mp3"):
-            return os.path.join(temp_dir, file)
-
-    raise Exception("Audio download failed")
+def extract_video_id(url: str) -> str:
+    match = re.search(r"(?:v=|youtu\.be/)([^&]+)", url)
+    if not match:
+        raise ValueError("Invalid YouTube URL")
+    return match.group(1)
 
 
 def seconds_to_hhmmss(seconds: float):
@@ -56,49 +35,26 @@ def seconds_to_hhmmss(seconds: float):
     return f"{h:02}:{m:02}:{s:02}"
 
 
-def find_timestamp_from_audio(audio_path: str, topic: str):
-    topic_words = topic.lower().split()
-
-    segments, _ = model.transcribe(
-        audio_path,
-        word_timestamps=True
-    )
-
-    words = []
-
-    for segment in segments:
-        for word in segment.words:
-            words.append({
-                "word": word.word.lower().strip(),
-                "start": word.start
-            })
-
-    for i in range(len(words) - len(topic_words) + 1):
-        match = True
-        for j in range(len(topic_words)):
-            if topic_words[j] not in words[i + j]["word"]:
-                match = False
-                break
-
-        if match:
-            return seconds_to_hhmmss(words[i]["start"])
-
-    return "00:00:00"
-
-
 @app.post("/ask")
 def ask(request: AskRequest):
 
-    audio_path = download_audio(request.video_url)
+    video_id = extract_video_id(request.video_url)
 
-    try:
-        timestamp = find_timestamp_from_audio(audio_path, request.topic)
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
+    topic = request.topic.lower()
+
+    for entry in transcript:
+        if topic in entry["text"].lower():
+            timestamp = seconds_to_hhmmss(entry["start"])
+            return {
+                "timestamp": timestamp,
+                "video_url": request.video_url,
+                "topic": request.topic
+            }
 
     return {
-        "timestamp": timestamp,
+        "timestamp": "00:00:00",
         "video_url": request.video_url,
         "topic": request.topic
     }
