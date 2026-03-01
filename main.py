@@ -6,13 +6,14 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
 
 load_dotenv()
 
@@ -48,11 +49,40 @@ def is_valid_hhmmss(value: str) -> bool:
     return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", value))
 
 
+def format_seconds_to_hhmmss(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def fetch_transcript_entries(video_url: str) -> List[Dict[str, Any]]:
+    # Extract a video ID from common YouTube URL formats.
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&].*)?$", video_url)
+    if not match:
+        raise RuntimeError("Invalid YouTube URL")
+    video_id = match.group(1)
+
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        return YouTubeTranscriptApi.get_transcript(video_id)
+
+    api = YouTubeTranscriptApi()
+    fetched = api.fetch(video_id)
+    if hasattr(fetched, "to_raw_data"):
+        return fetched.to_raw_data()
+    if isinstance(fetched, list):
+        return fetched
+    raise RuntimeError("Could not fetch transcript for fallback")
+
+
 def download_audio(video_url: str, out_dir: Path) -> Path:
     """Download audio-only from YouTube using yt-dlp."""
     output_template = str(out_dir / "audio.%(ext)s")
     cmd = [
         "yt-dlp",
+        "--no-playlist",
+        "--extractor-args",
+        "youtube:player_client=android,ios",
         "-x",
         "--audio-format",
         "mp3",
@@ -216,6 +246,46 @@ async def ask_gemini_for_timestamp(file_uri: str, mime_type: str, topic: str) ->
     return timestamp
 
 
+async def ask_gemini_from_transcript(transcript: str, topic: str) -> str:
+    prompt = (
+        "You are given a YouTube transcript with timestamps. "
+        f"Find when this topic is FIRST discussed: '{topic}'. "
+        "Return only valid JSON with one field: timestamp in HH:MM:SS format.\n\n"
+        f"TRANSCRIPT:\n{transcript[:12000]}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "timestamp": {"type": "STRING", "pattern": r"^\d{2}:\d{2}:\d{2}$"}
+                },
+                "required": ["timestamp"],
+            },
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{AIPIPE_BASE}/geminiv1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": AIPIPE_TOKEN, "Content-Type": "application/json"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    cleaned = text.strip().replace("```json", "").replace("```", "").strip()
+    parsed = json.loads(cleaned)
+    timestamp = parsed.get("timestamp", "")
+    if not is_valid_hhmmss(timestamp):
+        raise RuntimeError(f"Gemini returned invalid timestamp: {cleaned}")
+    return timestamp
+
+
 @app.get("/")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -225,28 +295,40 @@ async def health() -> Dict[str, str]:
 async def ask_topic(request: AskRequest) -> AskResponse:
     tmp = tempfile.TemporaryDirectory()
     remote_file_name = ""
+    audio_step_error = ""
 
     try:
         tmp_path = Path(tmp.name)
 
-        # 1) Download audio only from YouTube.
-        audio_path = await asyncio.to_thread(download_audio, request.video_url, tmp_path)
+        try:
+            # 1) Download audio only from YouTube.
+            audio_path = await asyncio.to_thread(download_audio, request.video_url, tmp_path)
 
-        # 2) Upload to Gemini Files API via AI Pipe.
-        uploaded_file = await upload_audio_file_to_gemini(audio_path)
-        remote_file_name = uploaded_file.get("name", "")
-        if not remote_file_name:
-            raise RuntimeError(f"Upload succeeded but no file name found: {uploaded_file}")
+            # 2) Upload to Gemini Files API via AI Pipe.
+            uploaded_file = await upload_audio_file_to_gemini(audio_path)
+            remote_file_name = uploaded_file.get("name", "")
+            if not remote_file_name:
+                raise RuntimeError(f"Upload succeeded but no file name found: {uploaded_file}")
 
-        # 3) Wait until Gemini marks the file ACTIVE.
-        active_file = await wait_for_file_active(remote_file_name)
-        file_uri = active_file.get("uri", "")
-        mime_type = active_file.get("mimeType", "audio/mpeg")
-        if not file_uri:
-            raise RuntimeError(f"ACTIVE file has no URI: {active_file}")
+            # 3) Wait until Gemini marks the file ACTIVE.
+            active_file = await wait_for_file_active(remote_file_name)
+            file_uri = active_file.get("uri", "")
+            mime_type = active_file.get("mimeType", "audio/mpeg")
+            if not file_uri:
+                raise RuntimeError(f"ACTIVE file has no URI: {active_file}")
 
-        # 4) Ask Gemini to locate first spoken mention.
-        timestamp = await ask_gemini_for_timestamp(file_uri, mime_type, request.topic)
+            # 4) Ask Gemini to locate first spoken mention.
+            timestamp = await ask_gemini_for_timestamp(file_uri, mime_type, request.topic)
+        except Exception as err:
+            # Fallback path for environments where yt-dlp extraction is blocked.
+            audio_step_error = str(err)
+            raw_transcript = await asyncio.to_thread(fetch_transcript_entries, request.video_url)
+            formatted = ""
+            for entry in raw_transcript:
+                start = float(entry.get("start", 0))
+                text = str(entry.get("text", "")).strip()
+                formatted += f"[{format_seconds_to_hhmmss(start)}] {text}\n"
+            timestamp = await ask_gemini_from_transcript(formatted, request.topic)
 
         # 5) Return required assignment format.
         return AskResponse(
@@ -259,6 +341,8 @@ async def ask_topic(request: AskRequest) -> AskResponse:
         detail = err.response.text if err.response is not None else str(err)
         raise HTTPException(status_code=500, detail=f"Upstream API error: {detail}")
     except Exception as err:
+        if audio_step_error:
+            raise HTTPException(status_code=500, detail=f"{audio_step_error} | fallback failed: {err}")
         raise HTTPException(status_code=500, detail=str(err))
     finally:
         # Cleanup local temporary files.

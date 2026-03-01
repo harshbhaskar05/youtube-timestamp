@@ -4,3 +4,4 @@ httpx
 python-dotenv
 pydantic
 yt-dlp
+youtube-transcript-api
