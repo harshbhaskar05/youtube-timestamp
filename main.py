@@ -36,6 +36,10 @@ STOPWORDS = {
 }
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/)([^&?/]+)", url)
     if not match:
@@ -60,12 +64,14 @@ def seconds_to_hhmmss(seconds: float):
 def jaccard_similarity(a, b):
     set_a = set(a)
     set_b = set(b)
-    intersection = set_a & set_b
-    union = set_a | set_b
-    if not union:
+    if not set_a and not set_b:
         return 0
-    return len(intersection) / len(union)
+    return len(set_a & set_b) / len(set_a | set_b)
 
+
+# ----------------------------
+# Main Endpoint
+# ----------------------------
 
 @app.post("/ask")
 def ask(request: AskRequest):
@@ -92,46 +98,37 @@ def ask(request: AskRequest):
             "topic": request.topic
         }
 
-    topic_words = normalize(request.topic)
-    topic_string = " ".join(topic_words)
+    # Build full word stream with timestamps
+    full_words = []
+    word_timestamps = []
 
+    for entry in transcript:
+        words = normalize(entry.text)
+        for w in words:
+            full_words.append(w)
+            word_timestamps.append(entry.start)
+
+    topic_words = normalize(request.topic)
+
+    if not topic_words or not full_words:
+        return {
+            "timestamp": "00:00:00",
+            "video_url": request.video_url,
+            "topic": request.topic
+        }
+
+    window_size = len(topic_words)
     best_score = 0
     best_time = 0
 
-    for i in range(len(transcript)):
-
-        # Merge 4 segments (captures split phrases)
-        combined_text = transcript[i].text
-        for j in range(1, 4):
-            if i + j < len(transcript):
-                combined_text += " " + transcript[i + j].text
-
-        text_words = normalize(combined_text)
-        text_string = " ".join(text_words)
-
-        # 1️⃣ Jaccard similarity
-        score = jaccard_similarity(topic_words, text_words)
-
-        # 2️⃣ Boost if phrase substring appears
-        if topic_string in text_string:
-            score += 0.4
-
-        # 3️⃣ Boost if most words appear
-        overlap = sum(1 for w in topic_words if w in text_words)
-        if len(topic_words) > 0 and overlap / len(topic_words) > 0.7:
-            score += 0.3
+    # Sliding window search
+    for i in range(len(full_words) - window_size + 1):
+        window = full_words[i:i + window_size]
+        score = jaccard_similarity(topic_words, window)
 
         if score > best_score:
             best_score = score
-            best_time = transcript[i].start
-
-        # Early confident return
-        if score >= 0.75:
-            return {
-                "timestamp": seconds_to_hhmmss(transcript[i].start),
-                "video_url": request.video_url,
-                "topic": request.topic
-            }
+            best_time = word_timestamps[i]
 
     return {
         "timestamp": seconds_to_hhmmss(best_time),
