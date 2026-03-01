@@ -1,21 +1,30 @@
-import os
-import httpx
+import asyncio
 import json
+import os
 import re
-from typing import List, Dict, Optional
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict
+
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from youtube_transcript_api import YouTubeTranscriptApi
 
-# Load your token from .env
 load_dotenv()
+
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+if not AIPIPE_TOKEN:
+    raise RuntimeError("Missing AIPIPE_TOKEN environment variable")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+AIPIPE_BASE = "https://aipipe.org"
 
 app = FastAPI()
 
-# Enable CORS (Required for browser-based testing)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,110 +32,244 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request format
+
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
-# Response format
+
 class AskResponse(BaseModel):
     timestamp: str
     video_url: str
     topic: str
 
-def get_video_id(url: str) -> str:
-    """Extracts the YouTube ID from a URL (e.g., https://youtu.be/dQw4w9WgXcQ -> dQw4w9WgXcQ)"""
-    patterns = [
-        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
-        r"youtu\.be\/([0-9A-Za-z_-]{11})"
+
+def is_valid_hhmmss(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", value))
+
+
+def download_audio(video_url: str, out_dir: Path) -> Path:
+    """Download audio-only from YouTube using yt-dlp."""
+    output_template = str(out_dir / "audio.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "-o",
+        output_template,
+        video_url,
     ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return ""
 
-def format_seconds_to_hhmmss(seconds: float) -> str:
-    """Converts 347 seconds to '00:05:47'"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"yt-dlp failed: {stderr}")
 
-async def get_timestamp_with_ai(transcript: str, topic: str) -> str:
-    """Sends the transcript and topic to Gemini to find the exact timestamp."""
-    if not AIPIPE_TOKEN:
-        return "00:00:00"
+    files = list(out_dir.glob("audio.*"))
+    if not files:
+        raise RuntimeError("yt-dlp did not produce an audio file")
 
-    prompt = f"""
-I will give you a YouTube transcript with timestamps.
-Find the moment where the following topic is first discussed: "{topic}"
+    return files[0]
 
-TRANSCRIPT:
-{transcript}
 
-IMPORTANT: Your response must be a JSON object with a single key "timestamp" in "HH:MM:SS" format.
-Example: {{"timestamp": "00:05:47"}}
-"""
+async def upload_audio_file_to_gemini(audio_path: Path, mime_type: str = "audio/mpeg") -> Dict[str, Any]:
+    """
+    Upload audio to Gemini Files API via AI Pipe (resumable upload).
+    """
+    file_bytes = audio_path.read_bytes()
 
-    url = "https://aipipe.org/geminiv1beta/models/gemini-2.0-flash-exp:generateContent"
-    headers = {
+    start_headers = {
         "x-goog-api-key": AIPIPE_TOKEN,
-        "Content-Type": "application/json"
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(len(file_bytes)),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json",
     }
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json"
+    start_payload = {"file": {"display_name": audio_path.name}}
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        start_resp = await client.post(
+            f"{AIPIPE_BASE}/upload/geminiv1beta/files",
+            headers=start_headers,
+            json=start_payload,
+        )
+        start_resp.raise_for_status()
+
+        upload_url = start_resp.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise RuntimeError("Gemini upload URL not returned by Files API")
+
+        upload_headers = {
+            "x-goog-api-key": AIPIPE_TOKEN,
+            "X-Goog-Upload-Command": "upload, finalize",
+            "X-Goog-Upload-Offset": "0",
+            "Content-Type": mime_type,
         }
+        finalize_resp = await client.post(upload_url, headers=upload_headers, content=file_bytes)
+        finalize_resp.raise_for_status()
+
+        data = finalize_resp.json()
+        if "file" not in data:
+            raise RuntimeError(f"Unexpected Files API upload response: {data}")
+        return data["file"]
+
+
+async def wait_for_file_active(file_name: str, timeout_sec: int = 300) -> Dict[str, Any]:
+    """Poll Files API until uploaded file state becomes ACTIVE."""
+    deadline = time.time() + timeout_sec
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while time.time() < deadline:
+            resp = await client.get(
+                f"{AIPIPE_BASE}/geminiv1beta/{file_name}",
+                headers={"x-goog-api-key": AIPIPE_TOKEN},
+            )
+            resp.raise_for_status()
+            file_obj = resp.json()
+
+            state_name = file_obj.get("state", {}).get("name", "")
+            if state_name == "ACTIVE":
+                return file_obj
+            if state_name == "FAILED":
+                raise RuntimeError("Gemini file processing failed")
+
+            await asyncio.sleep(2)
+
+    raise RuntimeError("Timed out waiting for Gemini file to become ACTIVE")
+
+
+async def delete_remote_file(file_name: str) -> None:
+    """Best-effort cleanup for Gemini uploaded files."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.delete(
+                f"{AIPIPE_BASE}/geminiv1beta/{file_name}",
+                headers={"x-goog-api-key": AIPIPE_TOKEN},
+            )
+    except Exception:
+        pass
+
+
+async def ask_gemini_for_timestamp(file_uri: str, mime_type: str, topic: str) -> str:
+    prompt = (
+        "You are given an audio file from a YouTube video. "
+        f"Find when this topic is FIRST spoken: '{topic}'. "
+        "Return only valid JSON with one field: timestamp in HH:MM:SS format."
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"file_data": {"mime_type": mime_type, "file_uri": file_uri}},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "timestamp": {
+                        "type": "STRING",
+                        "pattern": r"^\d{2}:\d{2}:\d{2}$",
+                    }
+                },
+                "required": ["timestamp"],
+            },
+        },
     }
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        resp = await client.post(
+            f"{AIPIPE_BASE}/geminiv1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={
+                "x-goog-api-key": AIPIPE_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload, timeout=60.0)
-            response.raise_for_status()
-            
-            data = response.json()
-            ai_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            
-            # Clean up the AI text
-            ai_text = ai_text.strip().replace("```json", "").replace("```", "")
-            result = json.loads(ai_text)
-            return result.get("timestamp", "00:00:00")
-    except Exception as e:
-        print(f"AI Analysis failed: {e}")
-        return "00:00:00"
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as exc:
+        raise RuntimeError(f"Unexpected Gemini response: {data}") from exc
+
+    cleaned = text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        parsed = json.loads(cleaned)
+        timestamp = parsed.get("timestamp", "")
+    except Exception:
+        match = re.search(r"\b\d{2}:\d{2}:\d{2}\b", cleaned)
+        timestamp = match.group(0) if match else ""
+
+    if not is_valid_hhmmss(timestamp):
+        raise RuntimeError(f"Gemini returned invalid timestamp: {cleaned}")
+
+    return timestamp
+
+
+@app.get("/")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
 
 @app.post("/ask", response_model=AskResponse)
-async def ask_topic(request: AskRequest):
-    # 1. Extract Video ID
-    video_id = get_video_id(request.video_url)
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+async def ask_topic(request: AskRequest) -> AskResponse:
+    tmp = tempfile.TemporaryDirectory()
+    remote_file_name = ""
 
-    # 2. Get Transcript
     try:
-        raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        # Format transcript: [00:01:23] This is the speech text...
-        formatted_transcript = ""
-        for entry in raw_transcript:
-            time_str = format_seconds_to_hhmmss(entry['start'])
-            formatted_transcript += f"[{time_str}] {entry['text']}\n"
-    except Exception as e:
-        print(f"Transcript Error: {e}")
-        raise HTTPException(status_code=500, detail="Could not get transcript for this video.")
+        tmp_path = Path(tmp.name)
 
-    # 3. Ask AI to find the topic in the transcript
-    # (We only send the first 10,000 characters to avoid huge context limits)
-    timestamp = await get_timestamp_with_ai(formatted_transcript[:10000], request.topic)
-    
-    return AskResponse(
-        timestamp=timestamp,
-        video_url=request.video_url,
-        topic=request.topic
-    )
+        # 1) Download audio only from YouTube.
+        audio_path = await asyncio.to_thread(download_audio, request.video_url, tmp_path)
+
+        # 2) Upload to Gemini Files API via AI Pipe.
+        uploaded_file = await upload_audio_file_to_gemini(audio_path)
+        remote_file_name = uploaded_file.get("name", "")
+        if not remote_file_name:
+            raise RuntimeError(f"Upload succeeded but no file name found: {uploaded_file}")
+
+        # 3) Wait until Gemini marks the file ACTIVE.
+        active_file = await wait_for_file_active(remote_file_name)
+        file_uri = active_file.get("uri", "")
+        mime_type = active_file.get("mimeType", "audio/mpeg")
+        if not file_uri:
+            raise RuntimeError(f"ACTIVE file has no URI: {active_file}")
+
+        # 4) Ask Gemini to locate first spoken mention.
+        timestamp = await ask_gemini_for_timestamp(file_uri, mime_type, request.topic)
+
+        # 5) Return required assignment format.
+        return AskResponse(
+            timestamp=timestamp,
+            video_url=request.video_url,
+            topic=request.topic,
+        )
+
+    except httpx.HTTPStatusError as err:
+        detail = err.response.text if err.response is not None else str(err)
+        raise HTTPException(status_code=500, detail=f"Upstream API error: {detail}")
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=str(err))
+    finally:
+        # Cleanup local temporary files.
+        tmp.cleanup()
+
+        # Best-effort remote cleanup.
+        if remote_file_name:
+            await delete_remote_file(remote_file_name)
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8001)
