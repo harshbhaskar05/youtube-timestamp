@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # 🔑 Your AI Pipe Token
-AIPIPE_TOKEN = "YOUR_NEW_AIPIPE_TOKEN"
+AIPIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjI0ZjMwMDA5MzRAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.x4aTFV9s5cV70shhbnLx2c-LX5NMs3El5dPg9ih7QEI"
 
 GEMINI_URL = "https://aipipe.org/geminiv1beta/models/gemini-1.5-pro:generateContent"
 
