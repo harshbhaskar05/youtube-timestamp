@@ -1,13 +1,9 @@
 import re
+import math
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-)
 
 app = FastAPI()
 
@@ -28,6 +24,10 @@ class AskRequest(BaseModel):
     video_url: str
     topic: str
 
+
+# -----------------------------
+# Utility Functions
+# -----------------------------
 
 STOPWORDS = {
     "the", "is", "are", "a", "an", "and", "or", "of", "to", "in",
@@ -64,48 +64,38 @@ def similarity_score(topic_words, text_words):
     return overlap / len(topic_words)
 
 
+# -----------------------------
+# Main Endpoint
+# -----------------------------
+
 @app.post("/ask")
 def ask(request: AskRequest):
 
-    try:
-        video_id = extract_video_id(request.video_url)
-        api = YouTubeTranscriptApi()
+    video_id = extract_video_id(request.video_url)
 
-        # Try English first, fallback to auto
-        try:
-            transcript = api.fetch(video_id, languages=["en"])
-        except:
-            transcript = api.fetch(video_id)
-
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
-        return {
-            "timestamp": "00:00:00",
-            "video_url": request.video_url,
-            "topic": request.topic
-        }
-    except Exception:
-        return {
-            "timestamp": "00:00:00",
-            "video_url": request.video_url,
-            "topic": request.topic
-        }
+    api = YouTubeTranscriptApi()
+    transcript = api.fetch(video_id)
 
     topic_words = normalize(request.topic)
 
     best_time = 0
     best_score = 0
 
+    # Sliding window (merge up to 3 segments)
     for i in range(len(transcript)):
         combined_text = transcript[i].text
 
+        # merge next two segments for better phrase capture
         if i + 1 < len(transcript):
             combined_text += " " + transcript[i + 1].text
         if i + 2 < len(transcript):
             combined_text += " " + transcript[i + 2].text
 
         text_words = normalize(combined_text)
+
         score = similarity_score(topic_words, text_words)
 
+        # Early high confidence return
         if score >= 0.6:
             return {
                 "timestamp": seconds_to_hhmmss(transcript[i].start),
