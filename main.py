@@ -44,14 +44,15 @@ def ask(request: AskRequest):
 
     video_id = extract_video_id(request.video_url)
 
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    api = YouTubeTranscriptApi()
+    transcript = api.fetch(video_id)
 
-    topic_words = request.topic.lower().split()
+    topic_lower = request.topic.lower()
 
     for entry in transcript:
-        text = entry["text"].lower()
-        if all(word in text for word in topic_words[:3]):
-            timestamp = seconds_to_hhmmss(entry["start"])
+        text = entry.text.lower()
+        if topic_lower in text:
+            timestamp = seconds_to_hhmmss(entry.start)
             return {
                 "timestamp": timestamp,
                 "video_url": request.video_url,
