@@ -2,13 +2,24 @@ import os
 import tempfile
 import subprocess
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 
 app = FastAPI()
 
-# Use tiny model for Render free tier
+# ✅ ADD THIS CORS BLOCK
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Use tiny model for Render
 model = WhisperModel("tiny", compute_type="int8")
+
 
 class AskRequest(BaseModel):
     video_url: str
