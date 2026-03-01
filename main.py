@@ -1,12 +1,20 @@
+import os
 import re
+import time
+import tempfile
+import subprocess
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
+
+# 🔑 Your AI Pipe Token
+AIPIPE_TOKEN = "YOUR_NEW_AIPIPE_TOKEN"
+
+GEMINI_URL = "https://aipipe.org/geminiv1beta/models/gemini-1.5-pro:generateContent"
 
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,42 +28,93 @@ class AskRequest(BaseModel):
     topic: str
 
 
-def extract_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|youtu\.be/)([^&?/]+)", url)
-    if not match:
-        raise ValueError("Invalid YouTube URL")
-    return match.group(1)
+def download_audio(video_url: str):
+    temp_dir = tempfile.mkdtemp()
+    output_template = os.path.join(temp_dir, "audio.%(ext)s")
+
+    command = [
+        "yt-dlp",
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "-o", output_template,
+        video_url
+    ]
+
+    subprocess.run(command, check=True)
+
+    for file in os.listdir(temp_dir):
+        if file.endswith(".mp3"):
+            return os.path.join(temp_dir, file)
+
+    raise Exception("Audio download failed")
 
 
-def seconds_to_hhmmss(seconds: float):
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02}:{m:02}:{s:02}"
+def find_timestamp_with_gemini(audio_path: str, topic: str):
+
+    headers = {
+        "Authorization": f"Bearer {AIPIPE_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/mp3",
+                            "data": audio_bytes.decode("latin1")
+                        }
+                    },
+                    {
+                        "text": f"""
+Listen to this audio carefully.
+
+Find the EXACT time when the following phrase is first spoken:
+
+"{topic}"
+
+Return ONLY one timestamp in HH:MM:SS format.
+Do not explain anything.
+"""
+                    }
+                ]
+            }
+        ]
+    }
+
+    response = requests.post(GEMINI_URL, headers=headers, json=body)
+
+    if response.status_code != 200:
+        print(response.text)
+        response.raise_for_status()
+
+    text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    match = re.search(r"\b\d{2}:\d{2}:\d{2}\b", text)
+    if match:
+        return match.group(0)
+
+    return "00:00:00"
 
 
 @app.post("/ask")
 def ask(request: AskRequest):
 
-    video_id = extract_video_id(request.video_url)
+    audio_path = download_audio(request.video_url)
 
-    # ✅ NEW API STYLE
-    transcript = YouTubeTranscriptApi().fetch(video_id)
-
-    topic = request.topic.lower()
-
-    for entry in transcript:
-        if topic in entry.text.lower():
-            timestamp = seconds_to_hhmmss(entry.start)
-            return {
-                "timestamp": timestamp,
-                "video_url": request.video_url,
-                "topic": request.topic
-            }
+    try:
+        timestamp = find_timestamp_with_gemini(audio_path, request.topic)
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
     return {
-        "timestamp": "00:00:00",
+        "timestamp": timestamp,
         "video_url": request.video_url,
         "topic": request.topic
     }
